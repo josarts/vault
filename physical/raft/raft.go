@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -21,6 +22,7 @@ import (
 	"github.com/hashicorp/go-raftchunking"
 	"github.com/hashicorp/go-uuid"
 	"github.com/hashicorp/raft"
+	autopilot "github.com/hashicorp/raft-autopilot"
 	snapshot "github.com/hashicorp/raft-snapshot"
 	raftboltdb "github.com/hashicorp/vault/physical/raft/logstore"
 	"github.com/hashicorp/vault/sdk/helper/consts"
@@ -68,7 +70,9 @@ type RaftBackend struct {
 	fsm *FSM
 
 	// raft is the instance of raft we will operate on.
-	raft *raft.Raft
+	raft           *raft.Raft
+	autopilot      *autopilot.Autopilot
+	followerStates *FollowerStates
 
 	// raftInitCh is used to block during HA lock acquisition if raft
 	// has not been initialized yet, which can occur if raft is being
@@ -175,6 +179,139 @@ type LeaderJoinInfo struct {
 
 	// TLSConfig for the API client to use when communicating with the leader node
 	TLSConfig *tls.Config `json:"-"`
+}
+
+type FollowerState struct {
+	AppliedIndex  uint64
+	LastHeartbeat time.Time
+	LastTerm      uint64
+}
+
+type FollowerStates struct {
+	l         sync.RWMutex
+	followers map[string]FollowerState
+}
+
+func NewFollowerStates() *FollowerStates {
+	return &FollowerStates{
+		followers: make(map[string]FollowerState),
+	}
+}
+
+func (s *FollowerStates) Update(nodeID string, appliedIndex uint64, term uint64) {
+	state := FollowerState{
+		AppliedIndex: appliedIndex,
+		LastTerm:     term,
+	}
+	if appliedIndex > 0 {
+		state.LastHeartbeat = time.Now()
+	}
+
+	s.l.Lock()
+	s.followers[nodeID] = state
+	s.l.Unlock()
+}
+
+func (s *FollowerStates) Clear() {
+	s.l.Lock()
+	for i := range s.followers {
+		delete(s.followers, i)
+	}
+	s.l.Unlock()
+}
+
+func (s *FollowerStates) Delete(nodeID string) {
+	s.l.RLock()
+	delete(s.followers, nodeID)
+	s.l.RUnlock()
+}
+
+func (s *FollowerStates) Get(nodeID string) FollowerState {
+	s.l.RLock()
+	state := s.followers[nodeID]
+	s.l.RUnlock()
+	return state
+}
+
+func (s *FollowerStates) MinIndex() uint64 {
+	var min uint64 = math.MaxUint64
+	minFunc := func(a, b uint64) uint64 {
+		if a > b {
+			return b
+		}
+		return a
+	}
+
+	s.l.RLock()
+	for _, state := range s.followers {
+		min = minFunc(min, state.AppliedIndex)
+	}
+	s.l.RUnlock()
+
+	if min == math.MaxUint64 {
+		return 0
+	}
+
+	return min
+}
+
+var _ autopilot.ApplicationIntegration = (*Delegate)(nil)
+
+type Delegate struct {
+	*RaftBackend
+}
+
+func (d *Delegate) AutopilotConfig() *autopilot.Config {
+	return &autopilot.Config{
+		CleanupDeadServers:      false,
+		LastContactThreshold:    2 * time.Second,
+		MaxTrailingLogs:         250,
+		MinQuorum:               3,
+		ServerStabilizationTime: 5 * time.Second,
+	}
+}
+
+func (d *Delegate) NotifyState(state *autopilot.State) {
+	panic("implement me")
+}
+
+func (d *Delegate) FetchServerStats(ctx context.Context, m map[raft.ServerID]*autopilot.Server) map[raft.ServerID]*autopilot.ServerStats {
+	panic("implement me")
+}
+
+func (d *Delegate) KnownServers() map[raft.ServerID]*autopilot.Server {
+	followerStates := d.RaftBackend.followerStates
+	followerStates.l.RLock()
+	defer followerStates.l.RUnlock()
+
+	ret := make(map[raft.ServerID]*autopilot.Server)
+	for id := range d.RaftBackend.followerStates.followers {
+		ret[raft.ServerID(id)] = &autopilot.Server{
+			ID:          raft.ServerID(id),
+			Name:        id,
+			RaftVersion: raft.ProtocolVersionMax,
+			NodeType:    autopilot.NodeVoter,
+		}
+	}
+
+	ret[raft.ServerID(d.localID)] = &autopilot.Server{
+		ID:          raft.ServerID(d.localID),
+		Name:        d.localID,
+		RaftVersion: raft.ProtocolVersionMax,
+		NodeType:    autopilot.NodeVoter,
+	}
+
+	return ret
+}
+
+func (d *Delegate) RemoveFailedServer(server *autopilot.Server) {
+	panic("implement me")
+}
+
+func (b *RaftBackend) SetFollowerStates(states *FollowerStates) {
+	b.l.Lock()
+	b.followerStates = states
+	b.l.Unlock()
 }
 
 // JoinConfig returns a list of information about possible leader nodes that
@@ -771,6 +908,8 @@ func (b *RaftBackend) SetupCluster(ctx context.Context, opts SetupOpts) error {
 	b.raft = raftObj
 	b.raftNotifyCh = raftNotifyCh
 
+	b.autopilot = autopilot.New(b.raft, &Delegate{}, autopilot.WithLogger(b.logger), autopilot.WithPromoter(autopilot.DefaultPromoter()))
+
 	if b.streamLayer != nil {
 		// Add Handler to the cluster.
 		opts.ClusterListener.AddHandler(consts.RaftStorageALPN, b.streamLayer)
@@ -784,6 +923,14 @@ func (b *RaftBackend) SetupCluster(ctx context.Context, opts SetupOpts) error {
 
 	b.logger.Trace("finished setting up raft cluster")
 	return nil
+}
+
+func (b *RaftBackend) StartAutopilot(ctx context.Context) {
+	b.autopilot.Start(ctx)
+}
+
+func (b *RaftBackend) StopAutopilot() {
+	b.autopilot.Stop()
 }
 
 // TeardownCluster shuts down the raft cluster
@@ -803,6 +950,15 @@ func (b *RaftBackend) TeardownCluster(clusterListener cluster.ClusterHook) error
 	}
 
 	b.raft = nil
+
+	// TODO: Check if autopilot needs to be stopped here
+	/*
+
+		if b.autopilot != nil {
+			<-b.autopilot.Stop()
+		}
+		b.autopilot = nil
+	*/
 
 	// If we're tearing down, then we need to recreate the raftInitCh
 	b.raftInitCh = make(chan struct{})
@@ -852,9 +1008,7 @@ func (b *RaftBackend) RemovePeer(ctx context.Context, peerID string) error {
 		return errors.New("raft storage is not initialized")
 	}
 
-	future := b.raft.RemoveServer(raft.ServerID(peerID), 0, 0)
-
-	return future.Error()
+	return b.autopilot.RemoveServer(raft.ServerID(peerID))
 }
 
 func (b *RaftBackend) GetConfiguration(ctx context.Context) (*RaftConfigurationResponse, error) {
@@ -901,8 +1055,13 @@ func (b *RaftBackend) AddPeer(ctx context.Context, peerID, clusterAddr string) e
 
 	b.logger.Debug("adding raft peer", "node_id", peerID, "cluster_addr", clusterAddr)
 
-	future := b.raft.AddVoter(raft.ServerID(peerID), raft.ServerAddress(clusterAddr), 0, 0)
-	return future.Error()
+	return b.autopilot.AddServer(&autopilot.Server{
+		ID:          raft.ServerID(peerID),
+		Name:        peerID,
+		Address:     raft.ServerAddress(clusterAddr),
+		RaftVersion: raft.ProtocolVersionMax,
+		NodeType:    autopilot.NodeVoter,
+	})
 }
 
 // Peers returns all the servers present in the raft cluster

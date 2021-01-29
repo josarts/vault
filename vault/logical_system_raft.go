@@ -184,7 +184,7 @@ func (b *SystemBackend) handleRaftRemovePeerUpdate() framework.OperationFunc {
 			return nil, err
 		}
 		if b.Core.raftFollowerStates != nil {
-			b.Core.raftFollowerStates.delete(serverID)
+			b.Core.raftFollowerStates.Delete(serverID)
 		}
 
 		return nil, nil
@@ -297,7 +297,7 @@ func (b *SystemBackend) handleRaftBootstrapAnswerWrite() framework.OperationFunc
 		}
 
 		if b.Core.raftFollowerStates != nil {
-			b.Core.raftFollowerStates.update(serverID, 0)
+			b.Core.raftFollowerStates.Update(serverID, 0, 0)
 		}
 
 		peers, err := raftBackend.Peers(ctx)
