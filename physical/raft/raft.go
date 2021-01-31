@@ -272,11 +272,32 @@ func (d *Delegate) AutopilotConfig() *autopilot.Config {
 }
 
 func (d *Delegate) NotifyState(state *autopilot.State) {
-	panic("implement me")
+	// TODO: implement
 }
 
-func (d *Delegate) FetchServerStats(ctx context.Context, m map[raft.ServerID]*autopilot.Server) map[raft.ServerID]*autopilot.ServerStats {
-	panic("implement me")
+func (d *Delegate) FetchServerStats(ctx context.Context, servers map[raft.ServerID]*autopilot.Server) map[raft.ServerID]*autopilot.ServerStats {
+	ret := make(map[raft.ServerID]*autopilot.ServerStats)
+
+	followerStates := d.RaftBackend.followerStates
+	followerStates.l.RLock()
+	defer followerStates.l.RUnlock()
+
+	now := time.Now()
+	for id, followerState := range followerStates.followers {
+		ret[raft.ServerID(id)] = &autopilot.ServerStats{
+			LastContact: now.Sub(followerState.LastHeartbeat),
+			LastTerm:    followerState.LastTerm,
+			LastIndex:   followerState.AppliedIndex,
+		}
+	}
+
+	leaderState, _ := d.fsm.LatestState()
+	ret[raft.ServerID(d.localID)] = &autopilot.ServerStats{
+		LastTerm:  leaderState.Term,
+		LastIndex: leaderState.Index,
+	}
+
+	return ret
 }
 
 func (d *Delegate) KnownServers() map[raft.ServerID]*autopilot.Server {
@@ -305,7 +326,7 @@ func (d *Delegate) KnownServers() map[raft.ServerID]*autopilot.Server {
 }
 
 func (d *Delegate) RemoveFailedServer(server *autopilot.Server) {
-	panic("implement me")
+	//TODO: implement
 }
 
 func (b *RaftBackend) SetFollowerStates(states *FollowerStates) {
@@ -908,7 +929,7 @@ func (b *RaftBackend) SetupCluster(ctx context.Context, opts SetupOpts) error {
 	b.raft = raftObj
 	b.raftNotifyCh = raftNotifyCh
 
-	b.autopilot = autopilot.New(b.raft, &Delegate{}, autopilot.WithLogger(b.logger), autopilot.WithPromoter(autopilot.DefaultPromoter()))
+	b.autopilot = autopilot.New(b.raft, &Delegate{b}, autopilot.WithLogger(b.logger), autopilot.WithPromoter(autopilot.DefaultPromoter()))
 
 	if b.streamLayer != nil {
 		// Add Handler to the cluster.
